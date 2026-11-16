@@ -33,3 +33,10 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+
+# Added by cargo
+
+/target
+
+*.vim
