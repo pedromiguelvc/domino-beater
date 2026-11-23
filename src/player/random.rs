@@ -1,9 +1,9 @@
-//! Baseline bot: plays a uniformly random legal move and chooses starters at random.
+//! Baseline bot: plays a uniformly random legal move and picks starters at random.
 
 use rand::{rngs::StdRng, Rng};
 
-use super::{Player, PlayerView, StarterChoice};
-use crate::game::Move;
+use super::{Player, PlayerView};
+use crate::{game::Move, Seat};
 
 pub struct RandomPlayer {
     rng: StdRng,
@@ -20,11 +20,7 @@ impl Player for RandomPlayer {
         self.rng.gen_range(0..legal.len())
     }
 
-    fn choose_starter(&mut self, _view: &PlayerView) -> StarterChoice {
-        if self.rng.gen_bool(0.5) {
-            StarterChoice::Myself
-        } else {
-            StarterChoice::Partner
-        }
+    fn choose_starter(&mut self, _view: &PlayerView, eligible: &[Seat]) -> Seat {
+        eligible[self.rng.gen_range(0..eligible.len())]
     }
 }

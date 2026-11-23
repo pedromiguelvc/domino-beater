@@ -7,7 +7,7 @@ use crate::{
     board::Board,
     game::{team_of, Outcome, Round},
     hand::Hand,
-    player::{Player, StarterChoice},
+    player::{Player, PlayerView},
     tile::{full_set, Tile},
     Seat,
 };
@@ -15,7 +15,7 @@ use crate::{
 /// A match ends when a team reaches this score.
 pub const WINNING_SCORE: u32 = 6;
 
-/// Safety limit on deals per match, so a degenerate bot cannot loop forever.
+/// Safety guard on deals per match. This is a code guard, not a game rule.
 pub const MAX_DEALS: u64 = 1_000_000;
 
 /// Event counters accumulated across matches.
@@ -38,7 +38,7 @@ pub struct Counters {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchResult {
-    /// Winning team index, or `None` if the deal limit was reached.
+    /// Winning team index, or `None` if the deal guard was reached.
     pub winner: Option<usize>,
     pub scores: [u32; 2],
     pub deals: u64,
@@ -49,8 +49,8 @@ pub struct MatchResult {
 enum Next {
     /// Highest double starts and must play it (first round, after a tie or a 4-double redeal).
     Forced,
-    /// The given seat's team chooses the starter (after a win, a special hand, or a blocked game).
-    Chooser(Seat),
+    /// The team that won the previous award chooses the starter.
+    Winner(usize),
 }
 
 /// Plays one match to completion.
@@ -89,7 +89,7 @@ pub fn play_match(
             let team = team_of(max_seat);
             scores[team] += base + bonus;
             bonus = 0;
-            next = Next::Chooser(max_seat);
+            next = Next::Winner(team);
             if scores[team] >= WINNING_SCORE {
                 return result(team, scores, deals);
             }
@@ -107,7 +107,7 @@ pub fn play_match(
                 let (seat, tile) = highest_double(&hands);
                 (seat, Some(tile))
             }
-            Next::Chooser(chooser) => (choose_next_starter(players, chooser, &hands), None),
+            Next::Winner(team) => (choose_next_starter(players, team, &hands), None),
         };
 
         counters.rounds_played += 1;
@@ -135,7 +135,7 @@ pub fn play_match(
                 let team = team_of(seat);
                 scores[team] += base + bonus;
                 bonus = 0;
-                next = Next::Chooser(seat);
+                next = Next::Winner(team);
                 if scores[team] >= WINNING_SCORE {
                     return result(team, scores, deals);
                 }
@@ -155,15 +155,7 @@ pub fn play_match(
                     counters.blocked_awards += 1;
                     scores[team] += 1 + bonus;
                     bonus = 0;
-                    // The winning-team member with fewer pips chooses; ties go to the lower seat.
-                    let low = team;
-                    let high = team + 2;
-                    let chooser = if round.hands[low].pips() <= round.hands[high].pips() {
-                        low
-                    } else {
-                        high
-                    };
-                    next = Next::Chooser(chooser);
+                    next = Next::Winner(team);
                     if scores[team] >= WINNING_SCORE {
                         return result(team, scores, deals);
                     }
@@ -199,34 +191,96 @@ fn highest_double(hands: &[Hand; 4]) -> (Seat, Tile) {
     unreachable!("a double-six set always contains a double")
 }
 
-/// The chooser's team picks the starter if it holds a double; otherwise the other team
-/// picks, beginning with the seat after the original chooser. The chosen player starts
-/// if they hold a double; otherwise the partner starts.
-fn choose_next_starter(players: &mut [Box<dyn Player>], chooser: Seat, hands: &[Hand; 4]) -> Seat {
-    let team_has_double = |team: usize| hands[team].doubles() + hands[team + 2].doubles() > 0;
-
-    let chooser = if team_has_double(team_of(chooser)) {
-        chooser
-    } else {
-        (chooser + 1) % 4
+/// Starter rule:
+/// - The winning team starts. If only one of its members holds a double, that member starts.
+/// - If both hold a double, the team decides between them. The first eligible seat is asked
+///   to decide, and the human prompt is the choice shown to that player.
+/// - If neither member holds a double, the same rule applies to the opposing team.
+///
+/// Because the boneyard holds only 4 of the 7 doubles, at least one team always has a double.
+fn choose_next_starter(players: &mut [Box<dyn Player>], team: usize, hands: &[Hand; 4]) -> Seat {
+    let eligible_in = |t: usize| -> Vec<Seat> {
+        [t, t + 2].into_iter().filter(|&s| hands[s].doubles() > 0).collect()
     };
-    debug_assert!(team_has_double(team_of(chooser)), "some team always holds a double");
 
-    let partner = (chooser + 2) % 4;
-    let view = crate::player::PlayerView {
-        seat: chooser,
-        hand: hands[chooser],
+    let mut eligible = eligible_in(team);
+    if eligible.is_empty() {
+        eligible = eligible_in(1 - team);
+    }
+    assert!(!eligible.is_empty(), "some team always holds a double");
+
+    if eligible.len() == 1 {
+        return eligible[0];
+    }
+
+    let decider = eligible[0];
+    let view = PlayerView {
+        seat: decider,
+        hand: hands[decider],
         board: Board::default(),
     };
-    let target = match players[chooser].choose_starter(&view) {
-        StarterChoice::Myself => chooser,
-        StarterChoice::Partner => partner,
-    };
-    if hands[target].doubles() > 0 {
-        target
-    } else if target == chooser {
-        partner
-    } else {
-        chooser
+    let chosen = players[decider].choose_starter(&view, &eligible);
+    assert!(eligible.contains(&chosen), "starter must be an eligible seat");
+    chosen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{game::Move, player::PlayerView as View, tile::Tile as T};
+
+    /// Test player: records whether it was asked, and always picks `pick`.
+    struct Scripted {
+        pick: Seat,
+        asked: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Player for Scripted {
+        fn choose_move(&mut self, _v: &View, _legal: &[Move]) -> usize {
+            0
+        }
+        fn choose_starter(&mut self, _v: &View, _eligible: &[Seat]) -> Seat {
+            self.asked.set(true);
+            self.pick
+        }
+    }
+
+    fn scripted(pick: Seat) -> (Box<dyn Player>, std::rc::Rc<std::cell::Cell<bool>>) {
+        let asked = std::rc::Rc::new(std::cell::Cell::new(false));
+        (Box::new(Scripted { pick, asked: asked.clone() }), asked)
+    }
+
+    fn hands_with_doubles(seats: &[Seat]) -> [Hand; 4] {
+        let mut hands = [Hand::from_tiles(&[T::new(0, 1)]); 4];
+        for &s in seats {
+            hands[s] = Hand::from_tiles(&[T::new(6, 6)]);
+        }
+        hands
+    }
+
+    #[test]
+    fn single_eligible_member_starts_without_a_choice() {
+        let (p0, asked0) = scripted(0);
+        let (p1, _) = scripted(1);
+        let mut players = [p0, p1, scripted(2).0, scripted(3).0];
+        let hands = hands_with_doubles(&[2]);
+        assert_eq!(choose_next_starter(&mut players, 0, &hands), 2);
+        assert!(!asked0.get());
+    }
+
+    #[test]
+    fn two_eligible_members_are_asked_and_the_choice_is_used() {
+        let (p0, asked0) = scripted(2);
+        let mut players = [p0, scripted(1).0, scripted(2).0, scripted(3).0];
+        let hands = hands_with_doubles(&[0, 2]);
+        assert_eq!(choose_next_starter(&mut players, 0, &hands), 2);
+        assert!(asked0.get());
+    }
+
+    #[test]
+    fn if_winning_team_has_no_double_the_opposing_team_decides() {
+        let mut players = [scripted(0).0, scripted(1).0, scripted(2).0, scripted(3).0];
+        let hands = hands_with_doubles(&[1]);
+        assert_eq!(choose_next_starter(&mut players, 0, &hands), 1);
     }
 }
