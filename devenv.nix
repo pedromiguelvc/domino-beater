@@ -18,6 +18,7 @@
   packages = [
     pkgs.cargo-watch
     pkgs.cargo-nextest
+    pkgs.claude-code
   ];
 
   scripts = {
